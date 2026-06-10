@@ -291,7 +291,7 @@ def authenticate():
             creds.refresh(Request())
         else:
             flow = InstalledAppFlow.from_client_secrets_file(SECRET_FILE, ["https://www.googleapis.com/auth/youtube.upload"])
-            creds = flow.run_localServer(port=0)
+            creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as f: pickle.dump(creds, f)
     return build("youtube", "v3", credentials=creds)
 

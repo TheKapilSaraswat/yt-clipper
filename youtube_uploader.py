@@ -26,7 +26,7 @@ def authenticate():
                 print("Download JSON and save as client_secret.json")
                 sys.exit(1)
             flow = InstalledAppFlow.from_client_secrets_file(SECRET_FILE, SCOPES)
-            creds = flow.run_localServer(port=0)
+            creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as f:
             pickle.dump(creds, f)
     return build("youtube", "v3", credentials=creds)

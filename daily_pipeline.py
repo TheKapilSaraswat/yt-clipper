@@ -217,7 +217,7 @@ def authenticate_youtube():
             flow = InstalledAppFlow.from_client_secrets_file(
                 SECRET_FILE, ["https://www.googleapis.com/auth/youtube.upload"]
             )
-            creds = flow.run_localServer(port=0)
+            creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "wb") as f:
             pickle.dump(creds, f)
     return build("youtube", "v3", credentials=creds)
@@ -256,6 +256,7 @@ def main():
 
     if need_count <= 0:
         log(f"Already uploaded {CLIPS_PER_DAY} clips today. Done.")
+        log("Delete upload_log.json to reset and re-upload today.")
         return
 
     log(f"Need {need_count} more clip(s) today")
@@ -359,6 +360,15 @@ def main():
             continue
 
     log(f"Done! Uploaded {uploaded_count} clip(s) today.")
+
+    # Cleanup old clips and original videos
+    if uploaded_count >= CLIPS_PER_DAY:
+        log("Cleaning up old files...")
+        for f in os.listdir("clips"):
+            os.remove(os.path.join("clips", f))
+        for f in os.listdir("original"):
+            os.remove(os.path.join("original", f))
+        log("Cleanup complete. Ready for tomorrow.")
 
 if __name__ == "__main__":
     main()
