@@ -1,0 +1,10 @@
+original/
+clips/
+*.mp4
+*.m4a
+*.pickle
+upload_log.json
+__pycache__/
+*.pyc
+*.pyo
+bin/
