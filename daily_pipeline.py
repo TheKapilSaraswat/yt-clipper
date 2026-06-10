@@ -202,9 +202,9 @@ def authenticate_youtube():
     from googleapiclient.discovery import build
 
     if not os.path.exists(SECRET_FILE):
-        log(f"ERROR: {SECRET_FILE} not found.")
-        log("Download from https://console.cloud.google.com -> APIs & Services -> Credentials")
-        sys.exit(1)
+        log(f"WARNING: {SECRET_FILE} not found. Skipping YouTube upload.")
+        log("Clips saved to 'clips/' folder. Upload later manually or add client_secret.json")
+        return None
 
     creds = None
     if os.path.exists(TOKEN_FILE):
@@ -325,22 +325,22 @@ def main():
         log("No clips to upload.")
         return
 
-    # Upload
+    # Upload (skip if no credentials)
     youtube = authenticate_youtube()
+    if not youtube:
+        log(f"\nCreated {len(clips_to_upload)} clip(s) in 'clips/' folder.")
+        log("Set up client_secret.json to enable auto-upload to YouTube.")
+        return
+
     uploaded_count = 0
 
     for idx, clip_path in enumerate(clips_to_upload[:CLIPS_PER_DAY]):
-        # Find which source video this clip came from
         clip_name = os.path.basename(clip_path)
-        source_url = None
         source_info = None
         for url, info in source_videos_info.items():
             if clip_name.startswith(os.path.splitext(info.get("title", ""))[0][:30]):
-                source_url = url
                 source_info = info
                 break
-
-        # Fallback: try extracting info from the file name
         if not source_info:
             source_info = {"title": clip_name.replace("_part", " - Part "), "channel": "Trending", "tags": [], "description": "", "view_count": 0, "duration": 30}
 
@@ -350,7 +350,7 @@ def main():
 
         try:
             upload_short(youtube, clip_path, caption, desc, tags)
-            used.append({"date": today, "file": clip_path, "title": caption, "source_url": source_url or ""})
+            used.append({"date": today, "file": clip_path, "title": caption})
             save_json(DAILY_LOG, used)
             uploaded_count += 1
             log(f"Uploaded {uploaded_count}/{len(clips_to_upload)}")
