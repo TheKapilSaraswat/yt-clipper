@@ -8,3 +8,5 @@ __pycache__/
 *.pyc
 *.pyo
 bin/
+
+client_secret.json
