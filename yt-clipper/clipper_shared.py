@@ -244,29 +244,58 @@ def check_video_detailed(info):
 
 # ─── BATCH SUITABLE VIDEO FINDER ─────────────────────────────────────────
 
+# Additional search queries used when the configured URLs don't yield enough
+FALLBACK_QUERIES = [
+    "ytsearch20:trending today",
+    "ytsearch20:viral video 2026",
+    "ytsearch20:most viewed today",
+    "ytsearch20:popular on youtube",
+    "ytsearch20:trending now",
+    "ytsearch20:new viral shorts",
+    "ytsearch20:trending clips",
+    "ytsearch20:top videos today",
+]
+
+
+def _fetch_from_query(query):
+    """Fetch flat playlist from a single yt-dlp query."""
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--flat-playlist", "--dump-json", "--no-download", query],
+            capture_output=True, text=True, check=True, timeout=60
+        )
+        items = []
+        for line in r.stdout.strip().split("\n"):
+            if line:
+                try:
+                    item = json.loads(line)
+                    if item.get("id"):
+                        items.append(item)
+                except json.JSONDecodeError:
+                    continue
+        return items
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return []
+
+
 def find_suitable_videos(count, used_source_urls=None, log_fn=print):
     if used_source_urls is None:
         used_source_urls = set()
-
-    candidates = get_trending()
-    if not candidates:
-        log_fn("No trending candidates found.")
-        return []
 
     seen_urls = set(used_source_urls)
     max_workers = config.cfg["concurrent_checks"]
     suitable = []
     all_results = []
 
+    # Collect all query sources: configured URLs first, then fallbacks
+    query_sources = list(config.cfg["trending_urls"]) + FALLBACK_QUERIES
+
     def check_candidate(c):
-        vid_url = f"https://youtube.com/watch?v={c.get('id', '')}"
-        if vid_url in seen_urls:
-            return None
         try:
-            info = get_video_info(vid_url)
+            info = get_video_info(c["url"])
             level, issues, checks = check_video_detailed(info)
             return {
-                "url": vid_url,
+                "url": c["url"],
                 "info": info,
                 "title": c.get("title", "?")[:80],
                 "level": level,
@@ -277,22 +306,49 @@ def find_suitable_videos(count, used_source_urls=None, log_fn=print):
         except Exception:
             return None
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(check_candidate, c): c for c in candidates}
-        for f in as_completed(futures):
-            result = f.result()
-            if result:
-                all_results.append(result)
-                if result["level"] != "HIGH":
-                    suitable.append(result)
+    for q_idx, query in enumerate(query_sources):
+        if len(suitable) >= count:
+            break
+
+        log_fn(f"Trying source [{q_idx+1}/{len(query_sources)}]...")
+        candidates = _fetch_from_query(query)
+        if not candidates:
+            continue
+        log_fn(f"  Found {len(candidates)} candidates")
+
+        # Build candidate dicts and dedup (main thread, no races)
+        fresh = []
+        for c in candidates:
+            vid_url = f"https://youtube.com/watch?v={c.get('id', '')}"
+            if vid_url not in seen_urls:
+                seen_urls.add(vid_url)
+                fresh.append({"url": vid_url, "title": c.get("title", "")})
+
+        if not fresh:
+            log_fn(f"  All already seen, skipping")
+            continue
+
+        need = count - len(suitable)
+        batch_size = min(len(fresh), max(need * 5, 30))
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(check_candidate, c): c for c in fresh[:batch_size]}
+            for f in as_completed(futures):
+                result = f.result()
+                if result:
+                    all_results.append(result)
+                    if result["level"] != "HIGH":
+                        suitable.append(result)
+
+        log_fn(f"  Suitable so far: {len(suitable)}/{count}")
 
     suitable.sort(key=lambda r: r["view_count"], reverse=True)
 
-    for r in sorted(all_results, key=lambda x: x["view_count"], reverse=True):
+    # Log all checked candidates
+    for r in sorted(all_results, key=lambda x: x["view_count"], reverse=True)[:15]:
         issues = ", ".join(r["issues"]) if r["issues"] else "none"
         log_fn(f"  {r['title'][:50]} | {r['view_count']:,} views | Risk: {r['level']} | Issues: {issues}")
 
-    log_fn(f"Suitable: {len(suitable)} videos")
+    log_fn(f"Suitable: {len(suitable)} videos found")
     return suitable[:count]
 
 
