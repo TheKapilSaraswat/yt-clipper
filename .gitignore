@@ -1,0 +1,8 @@
+node_modules/
+.env
+__pycache__/
+*.pyc
+yt_token.pickle
+client_secret.json
+clips/
+original/

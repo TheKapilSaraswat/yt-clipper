@@ -147,6 +147,155 @@ def check_video(info):
     return level, issues
 
 
+# ─── DETAILED RISK CHECK WITH WEIGHTED PROBABILITY SCORE ─────────────────
+
+RISK_WEIGHTS = {
+    "title_red_flags": 0.25,
+    "desc_disclaimers": 0.40,
+    "not_verified": 0.20,
+    "low_followers": 0.15,
+    "music_category": 0.35,
+    "music_keywords": 0.30,
+    "very_long": 0.10,
+    "channel_not_in_title": 0.10,
+    "age_restricted": 0.50,
+    "not_public": 0.60,
+    "low_engagement": 0.20,
+    "embedding_disabled": 0.30,
+}
+AUTO_HIGH_KEYS = {"age_restricted", "not_public", "embedding_disabled"}
+
+
+def check_video_detailed(info):
+    checks = []
+    title = info.get("title", "")
+    desc = info.get("description", "") or ""
+    channel = info.get("channel", "")
+    followers = info.get("channel_follower_count") or 0
+    verified = info.get("channel_is_verified", False)
+    cats = info.get("categories", []) or []
+    duration = info.get("duration", 0)
+    official = is_official(info)
+    tl = title.lower()
+
+    rfk = RED_FLAG_TITLE.copy()
+    if official:
+        rfk = [kw for kw in rfk if kw not in ("official video", "music video", "official audio", "audio")]
+    found = [kw for kw in rfk if kw in tl]
+    checks.append({"test": "Title red-flag keywords", "passed": not found, "detail": f"Keywords: {found}" if found else "Clean", "weight_key": "title_red_flags"})
+
+    dl = desc.lower()
+    found = [p for p in RED_FLAG_DESC if re.search(p, dl)]
+    checks.append({"test": "Description disclaimers", "passed": not found, "detail": f"Patterns: {found}" if found else "Clean", "weight_key": "desc_disclaimers"})
+
+    checks.append({"test": "Channel verified", "passed": verified, "detail": "Verified" if verified else "Not verified", "weight_key": "not_verified"})
+
+    min_fol = config.cfg["min_followers"]
+    checks.append({"test": "Follower count", "passed": followers >= min_fol, "detail": f"{followers:,} followers (min {min_fol:,})", "weight_key": "low_followers"})
+
+    music_cat = "music" in str(cats).lower() and not official
+    checks.append({"test": "Music category", "passed": not music_cat, "detail": f"Categories: {cats}" if music_cat else "Not music category", "weight_key": "music_category"})
+
+    found_music = [kw for kw in MUSIC_KEYWORDS if kw in tl]
+    checks.append({"test": "Music keywords in title", "passed": not found_music, "detail": f"Keywords: {found_music}" if found_music else "Clean", "weight_key": "music_keywords"})
+
+    max_dur = config.cfg["max_duration"]
+    checks.append({"test": "Duration", "passed": duration <= max_dur, "detail": f"{duration//60}min (max {max_dur//60}min)" if duration > max_dur else f"{duration//60}min OK", "weight_key": "very_long"})
+
+    ch_in_title = bool(set(channel.lower().split()) & set(tl.split()))
+    checks.append({"test": "Channel name in title", "passed": ch_in_title, "detail": "Present" if ch_in_title else "Missing", "weight_key": "channel_not_in_title"})
+
+    age = info.get("age_limit", 0)
+    checks.append({"test": "Age restriction", "passed": not (age and age > 0), "detail": f"Age limit: {age}" if age else "None", "weight_key": "age_restricted"})
+
+    avail = info.get("availability", "")
+    checks.append({"test": "Public availability", "passed": not (avail and avail != "public"), "detail": avail if avail and avail != "public" else "Public", "weight_key": "not_public"})
+
+    like_count = info.get("like_count", 0)
+    view_count = info.get("view_count", 0)
+    low_eng = view_count > 1000 and like_count > 0 and (like_count / view_count) < 0.005
+    checks.append({"test": "Engagement ratio", "passed": not low_eng, "detail": f"{like_count:,}/{view_count:,} ({like_count/view_count:.1%})" if low_eng else f"{like_count:,}/{view_count:,}", "weight_key": "low_engagement"})
+
+    embed = info.get("embed", None)
+    embed_disabled = False
+    if embed is not None:
+        embeddable = embed if isinstance(embed, bool) else embed.get("embeddable", True)
+        embed_disabled = not embeddable
+    checks.append({"test": "Embedding enabled", "passed": not embed_disabled, "detail": "Disabled" if embed_disabled else "Enabled", "weight_key": "embedding_disabled"})
+
+    score = 0.0
+    issues = []
+    for c in checks:
+        if not c["passed"]:
+            issues.append(c["test"])
+            score += RISK_WEIGHTS.get(c["weight_key"], 0)
+    score = min(score, 1.0)
+
+    critical_failures = [c for c in checks if c["weight_key"] in AUTO_HIGH_KEYS and not c["passed"]]
+    if critical_failures or score >= 0.5:
+        level = "HIGH"
+    elif score >= 0.2:
+        level = "MEDIUM"
+    else:
+        level = "LOW"
+
+    return level, issues, checks
+
+
+# ─── BATCH SUITABLE VIDEO FINDER ─────────────────────────────────────────
+
+def find_suitable_videos(count, used_source_urls=None, log_fn=print):
+    if used_source_urls is None:
+        used_source_urls = set()
+
+    candidates = get_trending()
+    if not candidates:
+        log_fn("No trending candidates found.")
+        return []
+
+    seen_urls = set(used_source_urls)
+    max_workers = config.cfg["concurrent_checks"]
+    suitable = []
+    all_results = []
+
+    def check_candidate(c):
+        vid_url = f"https://youtube.com/watch?v={c.get('id', '')}"
+        if vid_url in seen_urls:
+            return None
+        try:
+            info = get_video_info(vid_url)
+            level, issues, checks = check_video_detailed(info)
+            return {
+                "url": vid_url,
+                "info": info,
+                "title": c.get("title", "?")[:80],
+                "level": level,
+                "issues": issues,
+                "checks": checks,
+                "view_count": info.get("view_count", 0) or 0,
+            }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(check_candidate, c): c for c in candidates}
+        for f in as_completed(futures):
+            result = f.result()
+            if result:
+                all_results.append(result)
+                if result["level"] != "HIGH":
+                    suitable.append(result)
+
+    suitable.sort(key=lambda r: r["view_count"], reverse=True)
+
+    for r in sorted(all_results, key=lambda x: x["view_count"], reverse=True):
+        issues = ", ".join(r["issues"]) if r["issues"] else "none"
+        log_fn(f"  {r['title'][:50]} | {r['view_count']:,} views | Risk: {r['level']} | Issues: {issues}")
+
+    log_fn(f"Suitable: {len(suitable)} videos")
+    return suitable[:count]
+
+
 # ─── TRENDING DISCOVERY (#1) ─────────────────────────────────────────────
 
 def get_trending():

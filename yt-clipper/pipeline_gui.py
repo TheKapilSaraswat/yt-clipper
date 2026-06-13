@@ -14,7 +14,7 @@ from clipper_shared import (
     check_video,
     generate_caption,
     get_trending,
-    find_best_trending,
+    find_suitable_videos,
     download_video,
     clip_video,
     authenticate_youtube,
@@ -123,13 +123,11 @@ class PipelineGUI:
         self.count_label.config(text=f"Today: {count} / {CLIPS_PER_DAY}")
         self.root.after(5000, self.update_count)
 
-    def set_dashboard(self, info, video_url=""):
+    def set_dashboard(self, info, video_url="", checks=None):
         self.current_video_info = info
         title = info.get("title", "\u2013")
         channel = info.get("channel", "\u2013")
         views = info.get("view_count", 0)
-        verified = info.get("channel_is_verified", False)
-        followers = info.get("channel_follower_count") or 0
 
         level, issues = check_video(info)
         risk_colors = {"LOW": "#00e676", "MEDIUM": "#ffab00", "HIGH": "#ff1744"}
@@ -137,7 +135,21 @@ class PipelineGUI:
         issue_text = " | ".join(issues) if issues else "No issues detected"
         issue_color = "#ff1744" if issues else "#00e676"
         url_text = f"URL: {video_url}" if video_url else "URL: \u2013"
+
         caption = generate_caption(1, CLIPS_PER_DAY, info)
+
+        if checks:
+            passed = sum(1 for c in checks if c["passed"])
+            total = len(checks)
+            detail_lines = "\n".join(
+                f"{'\u2713' if c['passed'] else '\u2717'} {c['test']}: {c['detail']}"
+                for c in checks[:10]
+            )
+            if total > 10:
+                detail_lines += f"\n... and {total - 10} more"
+            display_text = f"Risk: {level} | Checks: {passed}/{total} passed\n{detail_lines}"
+        else:
+            display_text = issue_text
 
         self.root.after(0, lambda: (
             self.dash_url.config(text=url_text),
@@ -145,7 +157,7 @@ class PipelineGUI:
             self.dash_views.config(text=f"Views: {views:,}"),
             self.dash_risk.config(text=f"Risk: {level}", fg=risk_color),
             self.dash_channel.config(text=f"Channel: {channel}"),
-            self.dash_issues.config(text=issue_text, fg=issue_color),
+            self.dash_issues.config(text=display_text, fg=issue_color),
             self.dash_caption.config(text=caption[:150]),
         ))
 
@@ -173,7 +185,6 @@ class PipelineGUI:
             today = datetime.now().strftime("%Y-%m-%d")
             used_source_urls = set(u.get("source_url", "") for u in used if u.get("source_url"))
             uploaded_today = [u for u in used if u["date"] == today]
-            already = set(u["file"] for u in used)
             need = CLIPS_PER_DAY - len(uploaded_today)
             self.log(f"Need {need} more clips today")
 
@@ -181,30 +192,44 @@ class PipelineGUI:
                 self.log("Already done for today!", "#00e5ff")
                 return
 
-            available = []
+            # Reuse any existing clips
+            clips = []
             if os.path.exists("clips"):
+                already = set(u["file"] for u in used)
                 for f in sorted(os.listdir("clips")):
                     fp = os.path.join("clips", f)
                     if f.endswith(".mp4") and fp not in already:
-                        available.append(fp)
-            self.log(f"Unused clips found: {len(available)}")
-            clips = available[:need]
+                        clips.append(fp)
+            clips = clips[:need]
+            self.log(f"Existing clips to upload: {len(clips)}")
             remaining = need - len(clips)
-            source_videos_info = {}
-            source_url_by_video_id = {}
 
-            while remaining > 0:
-                self.log("Scanning trending videos...")
-                chosen_url, chosen_info = find_best_trending(used_source_urls, self.log)
-                if not chosen_url:
+            # Find suitable trending videos upfront (one batch)
+            videos = []
+            if remaining > 0:
+                self.log(f"\nScanning trending for {remaining} clean videos...")
+                videos = find_suitable_videos(remaining, used_source_urls, self.log)
+                if not videos:
                     self.log("No suitable video found!", "#ff1744")
-                    break
 
-                self.set_dashboard(chosen_info, chosen_url)
-                used_source_urls.add(chosen_url)
+            if not clips and not videos:
+                self.log("Nothing to process.", "#ff1744")
+                return
+
+            youtube = authenticate_youtube()
+            clip_index = len(clips)
+
+            for video in videos:
+                chosen_url = video["url"]
+                chosen_info = video["info"]
                 video_id = chosen_url.split("v=")[-1]
 
-                self.log("Downloading...")
+                # Show detailed check results on dashboard
+                self.set_dashboard(chosen_info, chosen_url, video.get("checks"))
+                used_source_urls.add(chosen_url)
+
+                clip_index += 1
+                self.log(f"\n[{clip_index}/{need}] Downloading: {chosen_info.get('title', '')[:60]}...")
                 vp = download_video(chosen_url)
                 ext = os.path.splitext(vp)[1]
                 renamed = os.path.join(os.path.dirname(vp), f"{video_id}{ext}")
@@ -212,54 +237,38 @@ class PipelineGUI:
                     os.rename(vp, renamed)
                     vp = renamed
 
-                self.log("Clipping into 30s segments...")
-                nc = clip_video(vp)
-                self.log(f"Created {len(nc)} clips", "#00e676")
-
-                source_videos_info[chosen_url] = chosen_info
-                source_url_by_video_id[video_id] = chosen_url
-
+                self.log("Clipping into short segment...")
+                nc = clip_video(vp)  # limit=1 by default → 1 clip
+                if not nc:
+                    self.log("  No clips created, skipping", "#ff1744")
+                    continue
                 cp = nc[0]
-                if cp not in already and cp not in clips:
-                    clips.append(cp)
-                    already.add(cp)
-                    remaining -= 1
+                self.log("Created 30s clip", "#00e676")
 
-            if not clips:
-                self.log("No clips to process.", "#ff1744")
-                return
+                clips.append(cp)
 
-            self.log(f"\nClips ready: {len(clips[:CLIPS_PER_DAY])}")
-            youtube = authenticate_youtube()
-            if not youtube:
-                self.log(f"\nDone! {len(clips)} clips saved in 'clips/' folder.", "#00e5ff")
-                if os.path.exists("original"):
-                    for f in os.listdir("original"):
-                        fp = os.path.join("original", f)
-                        if os.path.isfile(fp):
-                            os.remove(fp)
-                return
-
-            for idx, cp in enumerate(clips[:CLIPS_PER_DAY]):
-                clip_name = os.path.basename(cp)
-                clip_video_id = clip_name.split("_")[0]
-                src_url = source_url_by_video_id.get(clip_video_id)
-                info = source_videos_info.get(src_url) if src_url else None
-                if not info:
-                    info = {"title": clip_name.replace("_part", " - Part "), "tags": [], "description": "", "channel": "Trending", "view_count": 0, "duration": 30}
-                cap = generate_caption(idx + 1, len(clips), info)
+                # SEO caption
+                cap = generate_caption(clip_index, need, chosen_info)
                 desc = f"{cap}\n\n#shorts #trending #viral"
-                tags = ["shorts", "trending", "viral"] + (info.get("tags", []) or [])[:5]
-                self.log(f"[{idx+1}/{len(clips[:CLIPS_PER_DAY])}] {cap[:60]}...")
-                try:
-                    upload_short(youtube, cp, cap, desc, tags)
-                    used.append({"date": today, "file": cp, "title": cap, "source_url": src_url or ""})
-                    save_json(DAILY_LOG, used)
-                except Exception as e:
-                    self.log(f"  Failed: {e}", "#ff1744")
+                tags = ["shorts", "trending", "viral"] + (chosen_info.get("tags", []) or [])[:5]
+                self.log(f"Caption: {cap[:60]}...")
 
-            self.log("\nDone! Shorts uploaded today.", "#00e5ff")
+                # Upload immediately
+                if youtube:
+                    try:
+                        self.log(f"Uploading to YouTube...")
+                        upload_short(youtube, cp, cap, desc, tags)
+                        used.append({"date": today, "file": cp, "title": cap, "source_url": chosen_url})
+                        save_json(DAILY_LOG, used)
+                        self.log(f"\u2713 Uploaded! https://youtube.com/watch?v={video_id}", "#00e676")
+                    except Exception as e:
+                        self.log(f"  Upload failed: {e}", "#ff1744")
+                else:
+                    self.log("Clip saved locally (no YouTube auth)", "#ffab00")
 
+            self.log(f"\nDone! Processed {len(clips)} clips today.", "#00e5ff")
+
+            # Cleanup
             for folder in ("clips", "original"):
                 if os.path.exists(folder):
                     for f in os.listdir(folder):
