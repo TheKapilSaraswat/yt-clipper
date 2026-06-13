@@ -141,8 +141,10 @@ class PipelineGUI:
         if checks:
             passed = sum(1 for c in checks if c["passed"])
             total = len(checks)
+            tick = "\u2713"
+            cross = "\u2717"
             detail_lines = "\n".join(
-                f"{'\u2713' if c['passed'] else '\u2717'} {c['test']}: {c['detail']}"
+                f"{tick if c['passed'] else cross} {c['test']}: {c['detail']}"
                 for c in checks[:10]
             )
             if total > 10:
